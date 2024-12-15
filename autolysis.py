@@ -295,7 +295,7 @@ def generate_and_exec_code(data: pd.DataFrame, dataset_info_message: dict) -> bo
             # If execution failed, update the message for the next attempt
             if response_of_code_exec.startswith("Failure"):
                 error_message = f"Fix the code as it failed to execute with error: {response_of_code_exec}"
-                data["messages"].append({"role": "user", "content": error_message})
+                message_json["messages"].append({"role": "user", "content": error_message})
             else:
                 # If successful, break the loop
                 logging.info("Code executed successfully!")
