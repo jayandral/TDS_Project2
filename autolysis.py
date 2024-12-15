@@ -8,7 +8,7 @@
 # ///
 
 from pathlib import Path
-from typing import Any
+from typing import Any, List
 
 import pandas as pd
 import os
@@ -19,6 +19,7 @@ import logging
 import requests
 import base64
 import traceback
+import time
 
 # Constants for API interaction
 OPENAI_API = os.getenv(
@@ -28,7 +29,9 @@ OPENAI_API = os.getenv(
 # Check for the API Token, which is necessary for authentication
 AIPROXY_API_TOKEN = os.getenv("AIPROXY_TOKEN")
 if not AIPROXY_API_TOKEN:
-    raise ValueError("AIPROXY_API_TOKEN environment variable is not set.") # Ensure token is present for authentication
+    raise ValueError(
+        "AIPROXY_TOKEN environment variable is not set."
+    )  # Ensure token is present for authentication
 
 # API headers for authentication
 # Headers for making requests to the API, includes authorization header
@@ -82,6 +85,48 @@ Ensure all sections are well-formatted and provide a clear explanation for each 
 logging.basicConfig(level=logging.INFO)
 
 
+def validate_input_file(file_path: Path):
+    """
+    Validates that the input file has a .csv extension.
+
+    Args:
+        file_path (Path): The path to the input file.
+
+    Raises:
+        SystemExit: If the input file does not have a .csv extension, the program will log a warning and exit.
+    """
+    if not (file_path.suffix == ".csv" and file_path.is_file()):
+        logging.warning("Input file must be a CSV.")
+        sys.exit(1)
+
+    # Check if the file exists
+    file_path.resolve(strict=True)
+
+
+def read_csv(file_path: Path) -> pd.DataFrame:
+    """
+    Reads a CSV file into a pandas DataFrame.
+
+    Args:
+        file_path (Path): The path to the CSV file.
+
+    Returns:
+        pd.DataFrame: The contents of the CSV file as a pandas DataFrame.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        pd.errors.EmptyDataError: If the file is empty.
+        pd.errors.ParserError: If the file cannot be parsed.
+    """
+
+    logging.info("Reading CSV file.")
+    try:
+        return pd.read_csv(file_path, encoding="unicode_escape")
+    except Exception as e:
+        logging.error(f"Error reading CSV file: {e}")
+        sys.exit(1)
+
+
 def encode_png_image(image_path: str) -> str:
     """
     Encodes a PNG image to a base64 string, with a data URL prefix.
@@ -100,10 +145,169 @@ def encode_png_image(image_path: str) -> str:
         >>> encode_png_image("image.png")
         'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA...'
     """
-    # Open the image file in binary read mode and encode its content to base64
-    with open(image_path, "rb") as image_file:
-        # Return the base64 string with the appropriate prefix for embedding in web applications
-        return "data:image/png;base64," + base64.b64encode(image_file.read()).decode("utf-8")
+
+    if image_path.suffix.lower() != ".png":
+        logging.warning("File is not a PNG image.")
+        return ""
+
+    try:
+        # Open the image file in binary read mode and encode its content to base64
+        with open(image_path, "rb") as image_file:
+            # Return the base64 string with the appropriate prefix for embedding in web applications
+            return "data:image/png;base64," + base64.b64encode(
+                image_file.read()
+            ).decode("utf-8")
+    except Exception as e:
+        logging.error(f"Error encoding image {image_path.name}: {e}")
+        return ""
+
+
+def get_column_details(data: pd.DataFrame) -> str:
+    """
+    Generate detailed information about the columns of a given DataFrame.
+
+    This function provides a summary of the DataFrame's columns, including:
+    - General column information (excluding header/footer lines)
+    - Numerical details using the describe() method
+    - Categorical details such as unique value count, mode, and missing values
+
+    Args:
+        data (pd.DataFrame): The input DataFrame to analyze.
+
+    Returns:
+        dict: A dictionary containing:
+            - "column details": A string with general column information.
+            - "numerical details": A string with numerical details of the DataFrame.
+            - "categorical details": A string with details of categorical columns.
+    """
+
+    # Create a StringIO buffer to capture the DataFrame info output
+    buffer = io.StringIO()
+    data.info(buf=buffer)
+    info_string = buffer.getvalue()
+
+    # Extract column details from the info string (excluding header/footer lines)
+    column_details = "\n".join(info_string.split("\n")[3:-3])
+
+    # Generate numerical details using describe() method with formatting for readability
+    numerical_details = (
+        data.describe().apply(lambda s: s.apply("{0:.3f}".format)).to_string()
+    )
+
+    categorical_details = json.loads(
+        data.select_dtypes(include="object")
+        .apply(
+            lambda col: {
+                "unique": col.nunique(),
+                "mode": col.mode().iloc[0] if not col.mode().empty else None,
+                "missing": col.isnull().sum(),
+                "missing_percentage": col.isnull().mean() * 100,
+            }
+        )
+        .to_json()
+    )
+
+    cumulative_column_details = ""
+    for col_name, col_details in categorical_details.items():
+        # Create a summary for each column
+        column_summary = (
+            f"Column '{col_name}':\n  - Unique value count: {col_details['unique']}\n"
+        )
+        # Add mode details if available
+        if col_details["mode"].strip():
+            column_summary += f"  - Most frequent value (mode): {col_details['mode']}\n"
+        # Add missing values details
+        column_summary += f"  - Missing values: {col_details['missing']} ({col_details['missing_percentage']:.2f}% of total)\n\n"
+
+        cumulative_column_details += column_summary
+
+    return {
+        "column details": column_details,
+        "numerical details": numerical_details,
+        "categorical details": cumulative_column_details,
+    }
+
+
+def generate_and_exec_code(data: pd.DataFrame, dataset_info_message: dict) -> bool:
+    """
+    Generates and executes code using a GPT-based API and retries on failure.
+
+    Args:
+        data (pd.DataFrame): The input data to be used for code execution.
+        dataset_info_message (dict): Information about the dataset to be sent to the model.
+
+    Returns:
+        bool: True if the code was successfully generated and executed, False otherwise.
+
+    The function performs the following steps:
+    1. Constructs a JSON message to be sent to the GPT-based API.
+    2. Attempts to make a POST request to the API up to 3 times with exponential backoff on failure.
+    3. Parses the response and attempts to execute the generated code.
+    4. Logs errors and retries if the request or code execution fails.
+    5. Updates the message with error information for subsequent attempts if execution fails.
+    6. Returns True if the code is successfully executed, otherwise returns False.
+    """
+
+    backoff_delay = 2
+
+    # Create the data structure to be sent to the model (GPT-based API)
+    message_json = {
+        "model": "gpt-4o-mini",  # Specify the model to be used
+        "messages": [
+            {
+                "role": "system",
+                "content": PYTHON_CODE_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": json.dumps(dataset_info_message),
+            },
+        ],
+    }
+
+    # Loop to retry the request for code execution up to 3 times
+    for attempt in range(3):
+        try:
+            # Make the POST request to the OpenAI API
+            response = requests.post(
+                OPENAI_API,
+                headers=HEADERS,
+                json=message_json,
+            )
+
+            # If the request failed, log the error and retry
+            if response.status_code != 200:
+                logging.error(
+                    f"Attempt {attempt + 1} - Failed to get response from AIProxy. "
+                    f"Status code: {response.status_code}. Response: {response.text}"
+                )
+                logging.info(f"Retrying in {backoff_delay} seconds...")
+                time.sleep(backoff_delay)
+                continue
+
+            # Execute the code from the response
+            response_of_code_exec = execute_code(
+                response.json()["choices"][0]["message"]["content"], data
+            )
+
+            logging.info(f"Attempt {attempt + 1} - {response_of_code_exec}")
+
+            # If execution failed, update the message for the next attempt
+            if response_of_code_exec.startswith("Failure"):
+                error_message = f"Fix the code as it failed to execute with error: {response_of_code_exec}"
+                data["messages"].append({"role": "user", "content": error_message})
+            else:
+                # If successful, break the loop
+                logging.info("Code executed successfully!")
+                return True
+
+        except requests.RequestException as e:
+            # Log request-related errors (network issues, timeout, etc.)
+            logging.error(f"Attempt {attempt + 1} - Request failed: {str(e)}")
+            logging.info(f"Retrying in {backoff_delay} seconds...")
+            time.sleep(backoff_delay)
+
+    return False
 
 
 def execute_code(code: str, df: Any) -> str:
@@ -154,163 +358,21 @@ def execute_code(code: str, df: Any) -> str:
     return "Success: Code executed successfully"
 
 
-def analyse(file_path: Path) -> dict:
+def generate_graph_analysis(image_paths: List[Path]) -> List[str]:
     """
-    Analyzes the dataset by reading the CSV file, extracting column details,
-    numerical statistics, and categorical column summaries. Generates Python code
-    for dynamic visualizations and prepares the content for generating a structured README.
+    Analyzes a list of images by sending them to an AI API and returns the analysis results.
     Args:
-        file_path (Path): The file path to the CSV dataset.
+        image_paths (List[Path]): A list of paths to the images to be analyzed.
     Returns:
-        dict: A dictionary containing column, numerical, and categorical details of the dataset.
+        List[str]: A list of analysis results for each image. If an error occurs during the analysis of an image,
+                   an error message is included in the list for that image.
     """
-    
-    # Log the start of file reading
-    logging.info("Reading file")
 
-    # Read the CSV file into a pandas DataFrame
-    data = pd.read_csv(file_path, encoding="unicode_escape")
-
-    # Log the creation of a new directory for the file
-    logging.info("Creating a new directory for the file")
-
-    # Create a directory named after the file (without extension) for output purposes
-    os.makedirs(file_path.stem, mode=0o777, exist_ok=True)
-
-    # Create a StringIO buffer to capture the DataFrame info output
-    buffer = io.StringIO()
-    data.info(buf=buffer)  # Capture DataFrame info in the buffer
-    info_string = buffer.getvalue()  # Get the content of the buffer
-
-    # Extract column details from the info string (excluding header/footer lines)
-    column_details = "\n".join(info_string.split("\n")[3:-3])
-
-    # Generate numerical details using describe() method with formatting for readability
-    numerical_details = (
-        data.describe().apply(lambda s: s.apply("{0:.3f}".format)).to_string()
-    )
-
-    # Initialize categorical details as an empty string
-    categorical_details = ""
-
-    # Iterate through each column to analyze categorical data
-    for col in data.columns:
-        if data[col].dtype == "object":  # Check if the column is categorical
-            value_counts = data[
-                col
-            ].value_counts()  # Get the value counts for the column
-            value, value_count = value_counts.idxmax().strip(), value_counts.max()
-
-            # Determine mode value and frequency if applicable
-            mode_value = value if value_count > 1 and value != "" else None
-            mode_frequency = value_count if value_count > 1 and value != "" else None
-
-            # Calculate missing values count and percentage
-            missing_count = data[col].isnull().sum()
-            total_count = len(data[col])
-            missing_percentage = (missing_count / total_count) * 100
-
-            # Build the details string for the categorical column
-            column_summary = (
-                f"Column '{col}':\n" f"  - Unique value count: {data[col].nunique()}\n"
-            )
-
-            # Add mode details if available
-            if mode_value is not None:
-                column_summary += f"  - Most frequent value (mode): {mode_value} ({mode_frequency} occurrences)\n"
-
-            # Add missing values details
-            column_summary += (
-                f"  - Missing values: {missing_count} ({missing_percentage:.2f}% of total)\n"
-                f"\n"
-            )
-
-            # Append the categorical column details to the overall string
-            categorical_details += column_summary
-
-    # Prepare a dictionary to hold all extracted details about the dataset
-    dataset_info_message = {
-        "column details": column_details,
-        "numerical details": numerical_details,
-        "categorical details": categorical_details,
-    }
-
-    # Create the data structure to be sent to the model (GPT-based API)
-    message_json = {
-        "model": "gpt-4o-mini",  # Specify the model to be used
-        "messages": [
-            {
-                "role": "system",
-                "content": PYTHON_CODE_PROMPT,
-            },  # System message (prompt for the model)
-            {
-                "role": "user",
-                "content": json.dumps(dataset_info_message),
-            },  # User message with dataset info
-        ],
-    }
-
-    # Loop to retry the request for code execution up to 3 times
-    for attempt in range(3):
-        try:
-            # Make the POST request to the OpenAI API
-            response = requests.post(
-                OPENAI_API,
-                headers=HEADERS,
-                json=message_json,
-            )
-
-            # If the request failed, log the error and retry
-            if response.status_code != 200:
-                logging.error(
-                    f"Attempt {attempt + 1} - Failed to get response from AIProxy. "
-                    f"Status code: {response.status_code}. Response: {response.text}"
-                )
-                continue  # Retry if the request fails
-
-            # Parse the response JSON
-            response_json = response.json()
-            # Execute the code from the response
-            response_of_code_exec = execute_code(
-                response_json["choices"][0]["message"]["content"], data
-            )
-
-            logging.info(f"Attempt {attempt + 1} - {response_of_code_exec}")
-
-            # If execution failed, update the message for the next attempt
-            if response_of_code_exec.startswith("Failure"):
-                error_message = f"Fix the code as it failed to execute with error: {response_of_code_exec}"
-                if len(data["messages"]) == 2:
-                    data["messages"].append({"role": "user", "content": error_message})
-                else:
-                    data["messages"][2]["content"] = error_message
-            else:
-                # If successful, break the loop
-                logging.info("Code executed successfully!")
-                break
-
-        except requests.RequestException as e:
-            # Log request-related errors (network issues, timeout, etc.)
-            logging.error(f"Attempt {attempt + 1} - Request failed: {str(e)}")
-            continue
-
-        except KeyError as e:
-            # Log key errors if the response doesn't have expected keys
-            logging.error(
-                f"Attempt {attempt + 1} - KeyError in response parsing: {str(e)}"
-            )
-            break  # Exiting the loop as the response format is not as expected
-
-    images = list(Path("./").glob("*.png"))
-    image_description = []
-
-    # Check if no images are found
-    if len(images) == 0:
-        logging.warning("No images generated.")
-        sys.exit(1)
+    # List to store the image analysis results
+    image_analysis = []
 
     # Iterate over each image and send to the API for analysis
-    for image in images:
+    for image_path in image_paths:
         # Prepare data for API request
         message_json = {
             "model": "gpt-4o-mini",
@@ -319,13 +381,14 @@ def analyse(file_path: Path) -> dict:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Analyze this image."},
+                        {
+                            "type": "text",
+                            "text": "Analyze this image and make sure 'Description of the Graph', 'Key Observations', and 'Implications' are included.",
+                        },
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": encode_png_image(
-                                    image
-                                ),  # Ensure this function is correct
+                                "url": encode_png_image(image_path),
                                 "detail": "low",
                             },
                         },
@@ -341,54 +404,66 @@ def analyse(file_path: Path) -> dict:
             # Handle response based on status code
             if response.status_code != 200:
                 logging.error(
-                    f"Failed to get response from AIProxy for Image '{image.name}' explanation. "
+                    f"Failed to get response from AIProxy for Image '{image_path.name}' explanation. "
                     f"Status code: {response.status_code}, Response: {response.text}"
                 )
-                image_description.append(
-                    f"Failed to get response from AIProxy for Image '{image.name}' explanation."
+                image_analysis.append(
+                    f"Failed to get response from AIProxy for Image '{image_path.name}' explanation."
                 )
             else:
-                image_description.append(
+                image_analysis.append(
                     response.json()["choices"][0]["message"]["content"]
                 )
-                logging.info(f"Successfully analyzed image '{image.name}'.")
+                logging.info(f"Successfully analyzed image '{image_path.name}'.")
 
         except requests.RequestException as e:
             # Handle any request-related errors
             logging.error(
-                f"Error occurred while sending request for image '{image.name}': {e}"
+                f"Error occurred while sending request for image '{image_path.name}': {e}"
             )
-            image_description.append(
-                f"Error occurred while analyzing image '{image.name}'."
+            image_analysis.append(
+                f"Error occurred while analyzing image '{image_path.name}'."
             )
 
-    # Format the README content using the provided details
-    formatted_readme = README_PROMPT.format(
-        filename=file_path.stem.upper(),
-        column_details=column_details,
-        numerical_details=numerical_details,
-        categorical_details=categorical_details,
-        image1=images[0],
-        analysis1=image_description[0],
-        image2=images[1],
-        analysis2=image_description[1],
-        image3=images[2],
-        analysis3=image_description[2],
-    )
+    return image_analysis
+
+
+def generate_readme(
+    file_name: str,
+    column_details: dict,
+    images_path: List[Path],
+    image_analysis: List[str],
+) -> str:
+
+    if not (len(images_path) == 3 and len(image_analysis) == 3):
+        logging.warning("Number of images and analysis do not match.")
+        sys.exit(1)
 
     # Prepare the data for the API request
     message_json = {
         "model": "gpt-4o-mini",
         "messages": [
-            {"role": "system", "content": formatted_readme},
+            {
+                "role": "system",
+                "content": README_PROMPT.format(
+                    filename=file_name,
+                    column_details=column_details.get("column details", ""),
+                    numerical_details=column_details.get("numerical details", ""),
+                    categorical_details=column_details.get("categorical details", ""),
+                    image1=images_path[0],
+                    analysis1=image_analysis[0],
+                    image2=images_path[1],
+                    analysis2=image_analysis[1],
+                    image3=images_path[2],
+                    analysis3=image_analysis[2],
+                ),
+            },
             {
                 "role": "user",
                 "content": "Generate a README.md file for the content provided above",
             },
         ],
     }
-
-    readme_content = None
 
     # Send the request to the AI API
     try:
@@ -405,51 +480,77 @@ def analyse(file_path: Path) -> dict:
             # Retrieve the README content from the response
             readme_content = response.json()["choices"][0]["message"]["content"]
 
+            # Extract the markdown content from the response
+            for line in readme_content.strip().split("```"):
+                line = line.strip()
+                if line.startswith("markdown"):
+                    return line.strip("markdown").strip()
+
     except requests.RequestException as e:
         logging.error(
             f"Error occurred while sending the request for README generation: {e}"
         )
 
-    # If README content was not generated, log a warning and exit
+    return None
+
+
+def analyse(file_path: Path) -> dict:
+    """
+    Analyzes the dataset by reading the CSV file, extracting column details,
+    numerical statistics, and categorical column summaries. Generates Python code
+    for dynamic visualizations and prepares the content for generating a structured README.
+    Args:
+        file_path (Path): The file path to the CSV dataset.
+    Returns:
+        dict: A dictionary containing column, numerical, and categorical details of the dataset.
+    """
+
+    validate_input_file(file_path)
+
+    # Read the CSV file into a pandas DataFrame
+    data = read_csv(file_path)
+
+    # Create a directory named after the file (without extension) for output purposes
+    logging.info("Creating a new directory for the file")
+    os.makedirs(file_path.stem, mode=0o777, exist_ok=True)
+
+    # Prepare a dictionary to hold all extracted details about the dataset
+    dataset_info_message = get_column_details(data)
+
+    # Generate Python code for dynamic visualizations based on the dataset
+    has_plot_generated = generate_and_exec_code(data, dataset_info_message)
+
+    if not has_plot_generated:
+        logging.warning("Failed to generate plots.")
+        sys.exit(1)
+
+    image_paths = list(Path("./").glob("*.png"))
+
+    # Get the list of images generated from the code execution
+    image_analysis = generate_graph_analysis(image_paths)
+
+    readme_content = generate_readme(
+        file_path.stem, dataset_info_message, image_paths, image_analysis
+    )
+
+    # exit if readme content is None
     if readme_content is None:
         logging.warning("README content not generated.")
         sys.exit(1)
 
-    final_readme_content = None
-
-    # Extract the markdown content from the response
-    for line in readme_content.strip().split("```"):
-        line = line.strip()
-        if line.startswith("markdown"):
-            final_readme_content = line.strip("markdown").strip()
-            break
-
-    # If no markdown content was found, log a warning and exit
-    if final_readme_content is None:
-        logging.warning("No markdown content found in the README.")
-        sys.exit(1)
-
     # Save the README content to a file
     with open(f"{file_path.stem}/README.md", "w") as f:
-        f.write(final_readme_content)
+        f.write(readme_content)
 
     # Move and rename images
-    for image in images:
+    for image in image_paths:
         os.rename(image, f"{file_path.stem}/{image.name}")
 
 
 if __name__ == "__main__":
-    args = sys.argv
+    if len(sys.argv) != 2:
+        logging.warning("Usage: python script.py <csv_file_path>")
+        sys.exit(1)
 
-    if len(args) > 2:
-        logging.warning("Too many arguments provided")
-    elif len(args) != 2:
-        logging.warning("Provide a csv file path")
-    else:
-        file = args[1]
-        if not file.endswith(".csv"):
-            logging.warning("Need a csv file but got a different file type")
-            sys.exit(1)
-
-        logging.info(f"Analysing file {args[1]}")
-        analyse(Path(args[1]))
+    logging.info(f"Analysing file {sys.argv[1]}")
+    analyse(Path(sys.argv[1]))
